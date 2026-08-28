@@ -31,6 +31,20 @@ export interface Student {
   notes?: string;
 }
 
+export type UserRole = 'student' | 'faculty';
+
+export interface AuthUser {
+  id: string;
+  role: UserRole;
+  username: string;
+  name: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  user: AuthUser;
+}
+
 export interface LanguageStat {
   languageName: string;
   problemsSolved: number;

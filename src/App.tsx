@@ -10,12 +10,15 @@ import { SectionsView } from './pages/SectionsView';
 import { InterventionView } from './pages/InterventionView';
 import { ReportsView } from './pages/ReportsView';
 import { SettingsView } from './pages/SettingsView';
+import { LoginView } from './pages/LoginView';
+import { StudentDashboardView } from './pages/StudentDashboardView';
 
 import { StudentDetailModal } from './components/StudentDetailModal';
 import { StudentFormModal } from './components/StudentFormModal';
 import { ImportStudentsModal } from './components/ImportStudentsModal';
 import { BatchFetchModal } from './components/BatchFetchModal';
 import { PrivacyNoticeModal } from './components/PrivacyNoticeModal';
+import { ChangePasswordModal } from './components/ChangePasswordModal';
 
 import { api } from './services/api';
 import { 
@@ -24,12 +27,14 @@ import {
   BatchStat, 
   StudentWithLatest, 
   SystemSettings, 
-  BatchFetchProgress 
+  BatchFetchProgress,
+  AuthUser
 } from './types';
 import { RefreshCw, AlertCircle } from 'lucide-react';
 
 export function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('dashboard');
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -52,11 +57,34 @@ export function App() {
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isBatchModalOpen, setIsBatchModalOpen] = useState(false);
   const [isPrivacyOpen, setIsPrivacyOpen] = useState(false);
+  const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
 
-  // Initial Load
+  // Auth Session Restore
   useEffect(() => {
-    loadAllData();
+    const storedToken = localStorage.getItem('auth_token');
+    const storedUser = localStorage.getItem('auth_user');
+    if (storedToken && storedUser) {
+      try {
+        setAuthUser(JSON.parse(storedUser));
+      } catch (e) {
+        localStorage.removeItem('auth_token');
+        localStorage.removeItem('auth_user');
+      }
+    }
+
+    const handleUnauthorized = () => {
+      handleLogout();
+    };
+    window.addEventListener('auth-unauthorized', handleUnauthorized);
+    return () => window.removeEventListener('auth-unauthorized', handleUnauthorized);
   }, []);
+
+  // Initial Load (Only when faculty logged in)
+  useEffect(() => {
+    if (authUser && authUser.role === 'faculty') {
+      loadAllData();
+    }
+  }, [authUser]);
 
   // Poll batch progress
   useEffect(() => {
@@ -110,6 +138,18 @@ export function App() {
   const handleOpenEditStudent = (s: StudentWithLatest) => {
     setStudentToEdit(s);
     setIsFormOpen(true);
+  };
+
+  const handleLogin = (user: AuthUser, token: string) => {
+    localStorage.setItem('auth_token', token);
+    localStorage.setItem('auth_user', JSON.stringify(user));
+    setAuthUser(user);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('auth_user');
+    setAuthUser(null);
   };
 
   // Render active view
@@ -235,6 +275,36 @@ export function App() {
     }
   };
 
+  if (!authUser) {
+    return <LoginView onLogin={handleLogin} />;
+  }
+
+  if (authUser.role === 'student') {
+    return (
+      <div className="min-h-screen bg-[#f8fafc] text-[#1e293b] flex flex-col font-sans antialiased selection:bg-blue-500 selection:text-white">
+        <Header 
+          onOpenBatchSync={() => {}} 
+          onOpenPrivacy={() => setIsPrivacyOpen(true)} 
+          user={authUser} 
+          onLogout={handleLogout} 
+          onOpenChangePassword={() => setIsChangePasswordOpen(true)}
+        />
+        <main className="flex-1 p-4 sm:p-5 lg:p-6 overflow-y-auto w-full mx-auto max-w-[1200px]">
+          <StudentDashboardView studentId={authUser.id} />
+        </main>
+        
+        <ChangePasswordModal
+          isOpen={isChangePasswordOpen}
+          onClose={() => setIsChangePasswordOpen(false)}
+        />
+        <PrivacyNoticeModal
+          isOpen={isPrivacyOpen}
+          onClose={() => setIsPrivacyOpen(false)}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-[#f8fafc] text-[#1e293b] flex flex-col font-sans antialiased selection:bg-blue-500 selection:text-white">
       
@@ -245,6 +315,9 @@ export function App() {
         batchProgress={batchProgress}
         onRefreshCurrentView={loadAllData}
         isRefreshing={loading}
+        user={authUser}
+        onLogout={handleLogout}
+        onOpenChangePassword={() => setIsChangePasswordOpen(true)}
       />
 
       {/* Main Layout Area */}
@@ -300,6 +373,11 @@ export function App() {
       <PrivacyNoticeModal
         isOpen={isPrivacyOpen}
         onClose={() => setIsPrivacyOpen(false)}
+      />
+
+      <ChangePasswordModal
+        isOpen={isChangePasswordOpen}
+        onClose={() => setIsChangePasswordOpen(false)}
       />
 
     </div>

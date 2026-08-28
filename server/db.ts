@@ -37,6 +37,15 @@ const DEFAULT_SETTINGS: SystemSettings = {
   },
 };
 
+export interface UserRecord {
+  id: string;
+  username: string;
+  password_hash: string;
+  role: 'student' | 'faculty';
+  student_id?: string;
+  name: string;
+}
+
 interface MemoryStore {
   students: Student[];
   snapshots: Snapshot[];
@@ -46,6 +55,7 @@ interface MemoryStore {
   potd_items: POTDItem[];
   curated_tracks: CuratedTrack[];
   curated_problems: CuratedProblem[];
+  users: UserRecord[];
 }
 
 export class DatabaseService {
@@ -58,7 +68,8 @@ export class DatabaseService {
     logs: [],
     potd_items: [],
     curated_tracks: [...SEED_TRACKS],
-    curated_problems: [...SEED_PROBLEMS]
+    curated_problems: [...SEED_PROBLEMS],
+    users: []
   };
   private isFallbackMode = false;
 
@@ -200,6 +211,16 @@ export class DatabaseService {
           level TEXT NOT NULL,
           message TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          role TEXT NOT NULL,
+          name TEXT NOT NULL,
+          student_id TEXT UNIQUE,
+          FOREIGN KEY (student_id) REFERENCES students(id) ON DELETE CASCADE
+        );
       `);
 
       // Migrations for existing settings table
@@ -281,6 +302,7 @@ export class DatabaseService {
         const raw = fs.readFileSync(JSON_BACKUP_FILE, 'utf-8');
         const parsed = JSON.parse(raw);
         this.memStore = {
+          users: [],
           students: parsed.students || [],
           snapshots: parsed.snapshots || [],
           recent_submissions: parsed.recent_submissions || [],
@@ -1083,6 +1105,7 @@ export class DatabaseService {
   public resetToDemo(): void {
     if (this.isFallbackMode || !this.sqliteDb) {
       this.memStore = {
+        users: [],
         students: [],
         snapshots: [],
         recent_submissions: [],
@@ -1129,6 +1152,48 @@ export class DatabaseService {
     }
     const rows = this.sqliteDb.prepare('SELECT timestamp, level, message FROM logs ORDER BY id DESC LIMIT 500').all() as any[];
     return rows.reverse();
+  }
+
+  // --- Users Auth ---
+  public getUserByUsername(username: string): UserRecord | undefined {
+    if (this.isFallbackMode || !this.sqliteDb) {
+      return this.memStore.users.find(u => u.username.toLowerCase() === username.toLowerCase());
+    }
+    return this.sqliteDb.prepare('SELECT * FROM users WHERE LOWER(username) = LOWER(?)').get(username) as UserRecord | undefined;
+  }
+
+  public createUser(user: UserRecord): void {
+    if (this.isFallbackMode || !this.sqliteDb) {
+      this.memStore.users.push(user);
+      this.persistMemoryStore();
+      return;
+    }
+    this.sqliteDb.prepare(`
+      INSERT INTO users (id, username, password_hash, role, name, student_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(user.id, user.username, user.password_hash, user.role, user.name, user.student_id || null);
+  }
+
+  public updateUserPassword(username: string, newHash: string): void {
+    if (this.isFallbackMode || !this.sqliteDb) {
+      const user = this.memStore.users.find(u => u.username.toLowerCase() === username.toLowerCase());
+      if (user) {
+        user.password_hash = newHash;
+        this.persistMemoryStore();
+      }
+      return;
+    }
+    this.sqliteDb.prepare(`
+      UPDATE users SET password_hash = ? WHERE LOWER(username) = LOWER(?)
+    `).run(newHash, username);
+  }
+
+  public getUsersCount(): number {
+    if (this.isFallbackMode || !this.sqliteDb) {
+      return this.memStore.users.length;
+    }
+    const res = this.sqliteDb.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number };
+    return res.c;
   }
 }
 

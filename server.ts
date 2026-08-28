@@ -31,11 +31,16 @@ import {
   SchedulerStatus 
 } from './src/types.js';
 
+import { requireAuth, requireFaculty, initializeAdmin, generateToken } from './server/auth.js';
+import bcrypt from 'bcryptjs';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+
+initializeAdmin().catch(console.error);
 
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -226,13 +231,73 @@ function getAllEnrichedStudents(): StudentWithLatest[] {
 
 // ================= API ROUTES =================
 
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    const user = db.getUserByUsername(username);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isValid = await bcrypt.compare(password, user.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = generateToken(user);
+    res.json({
+      token,
+      user: {
+        id: user.student_id || user.id,
+        role: user.role,
+        username: user.username,
+        name: user.name
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error during login' });
+  }
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Valid current password and new password (min 6 chars) are required' });
+    }
+
+    const user = (req as any).user;
+    const dbUser = db.getUserByUsername(user.username);
+    
+    if (!dbUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const isValid = await bcrypt.compare(currentPassword, dbUser.password_hash);
+    if (!isValid) {
+      return res.status(401).json({ error: 'Current password is incorrect.' });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    db.updateUserPassword(user.username, newHash);
+    
+    res.json({ success: true, message: 'Password changed successfully.' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error during password change' });
+  }
+});
+
 // 1. Health check
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
 // 2. Dashboard Summary
-app.get('/api/dashboard', (req, res) => {
+app.get('/api/dashboard', requireAuth, requireFaculty, (req, res) => {
   try {
     const students = getAllEnrichedStudents();
     const settings = db.getSettings();
@@ -280,7 +345,7 @@ app.get('/api/dashboard', (req, res) => {
 });
 
 // 3. Students - List & Filter
-app.get('/api/students', (req, res) => {
+app.get('/api/students', requireAuth, requireFaculty, (req, res) => {
   try {
     let students = getAllEnrichedStudents();
     const { search, section, year, batch, tier, activity } = req.query;
@@ -322,8 +387,12 @@ app.get('/api/students', (req, res) => {
 });
 
 // 4. Student - Get Single Detail & History
-app.get('/api/students/:id', (req, res) => {
+app.get('/api/students/:id', requireAuth, (req, res) => {
   try {
+    const user = (req as any).user;
+    if (user.role === 'student' && user.id !== req.params.id) {
+      return res.status(403).json({ error: 'Forbidden: Cannot access other student data' });
+    }
     const student = db.getStudentById(req.params.id);
     if (!student) {
       return res.status(404).json({ error: 'Student not found.' });
@@ -344,7 +413,7 @@ app.get('/api/students/:id', (req, res) => {
 });
 
 // 5. Student - Create
-app.post('/api/students', (req, res) => {
+app.post('/api/students', requireAuth, requireFaculty, async (req, res) => {
   try {
     const { register_no, student_name, section, year, batch, username, email, mentor, academic_year, notes } = req.body;
 
@@ -379,6 +448,17 @@ app.post('/api/students', (req, res) => {
 
     db.addLog('INFO', `Added student ${student.student_name} (${student.register_no}) with LeetCode handle ${student.username}.`);
 
+    const defaultPassword = student.register_no;
+    const passwordHash = await bcrypt.hash(defaultPassword, 10);
+    db.createUser({
+      id: `u_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+      username: student.register_no,
+      password_hash: passwordHash,
+      role: 'student',
+      name: student.student_name,
+      student_id: student.id,
+    });
+
     res.status(201).json(student);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to create student.' });
@@ -386,7 +466,7 @@ app.post('/api/students', (req, res) => {
 });
 
 // 6. Student - Update
-app.put('/api/students/:id', (req, res) => {
+app.put('/api/students/:id', requireAuth, requireFaculty, (req, res) => {
   try {
     const student = db.getStudentById(req.params.id);
     if (!student) {
@@ -417,7 +497,7 @@ app.put('/api/students/:id', (req, res) => {
 });
 
 // 7. Student - Delete
-app.delete('/api/students/:id', (req, res) => {
+app.delete('/api/students/:id', requireAuth, requireFaculty, (req, res) => {
   try {
     const student = db.getStudentById(req.params.id);
     if (!student) {
@@ -432,7 +512,7 @@ app.delete('/api/students/:id', (req, res) => {
 });
 
 // 8. Bulk Import Students (CSV / JSON data payload)
-app.post('/api/students/import', (req, res) => {
+app.post('/api/students/import', requireAuth, requireFaculty, async (req, res) => {
   try {
     const { rows } = req.body;
     if (!Array.isArray(rows) || rows.length === 0) {
@@ -444,7 +524,8 @@ app.post('/api/students/import', (req, res) => {
     const existingUsers = new Set(db.getStudents().map(s => s.username.toLowerCase()));
     const existingRegs = new Set(db.getStudents().map(s => s.register_no.toLowerCase()));
 
-    rows.forEach((r, idx) => {
+    for (let idx = 0; idx < rows.length; idx++) {
+      const r = rows[idx];
       const regNo = (r.register_no || r['Register Number'] || r['Register No'] || r.reg_no || '').toString().trim().toUpperCase();
       const name = (r.student_name || r['Student Name'] || r.name || '').toString().trim();
       const section = (r.section || r['Section'] || 'A').toString().trim().toUpperCase();
@@ -456,17 +537,17 @@ app.post('/api/students/import', (req, res) => {
 
       if (!regNo || !name || !username) {
         errors.push({ row: idx + 1, identifier: regNo || name || `Row ${idx + 1}`, error: 'Missing mandatory field (Register No, Name, or Username).' });
-        return;
+        continue;
       }
 
       if (existingUsers.has(username.toLowerCase())) {
         errors.push({ row: idx + 1, identifier: username, error: `Duplicate username '${username}' already exists in database.` });
-        return;
+        continue;
       }
 
       if (existingRegs.has(regNo.toLowerCase())) {
         errors.push({ row: idx + 1, identifier: regNo, error: `Duplicate Register No '${regNo}' already exists in database.` });
-        return;
+        continue;
       }
 
       const newStudent = db.addStudent({
@@ -482,10 +563,20 @@ app.post('/api/students/import', (req, res) => {
         active: true,
       });
 
+      const passwordHash = await bcrypt.hash(regNo, 10);
+      db.createUser({
+        id: `u_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+        username: regNo,
+        password_hash: passwordHash,
+        role: 'student',
+        name: name,
+        student_id: newStudent.id,
+      });
+
       existingUsers.add(username.toLowerCase());
       existingRegs.add(regNo.toLowerCase());
       inserted.push(newStudent);
-    });
+    }
 
     db.addLog('INFO', `Imported ${inserted.length} students. Encountered ${errors.length} validation errors.`);
 
@@ -502,7 +593,7 @@ app.post('/api/students/import', (req, res) => {
 });
 
 // 9. Download Student Master Import Template (.xlsx / .csv)
-app.get('/api/students/template', (req, res) => {
+app.get('/api/students/template', requireAuth, requireFaculty, (req, res) => {
   try {
     const format = req.query.format === 'csv' ? 'csv' : 'xlsx';
     if (format === 'csv') {
@@ -522,7 +613,7 @@ app.get('/api/students/template', (req, res) => {
 });
 
 // 10. Fetch Single Student LeetCode Data
-app.post('/api/fetch/student/:id', async (req, res) => {
+app.post('/api/fetch/student/:id', requireAuth, requireFaculty, async (req, res) => {
   try {
     const student = db.getStudentById(req.params.id);
     if (!student) {
@@ -650,7 +741,7 @@ app.post('/api/fetch/student/:id', async (req, res) => {
 });
 
 // 11. Batch Fetch All Students (Async Background Execution)
-app.post('/api/fetch/all', async (req, res) => {
+app.post('/api/fetch/all', requireAuth, requireFaculty, async (req, res) => {
   if (batchProgress.is_running) {
     return res.status(409).json({
       error: 'A batch fetch operation is already in progress.',
@@ -683,12 +774,12 @@ app.post('/api/fetch/all', async (req, res) => {
 });
 
 // 12. Batch Fetch Progress
-app.get('/api/fetch/progress', (req, res) => {
+app.get('/api/fetch/progress', requireAuth, requireFaculty, (req, res) => {
   res.json(batchProgress);
 });
 
 // 13. Cancel Batch Fetch
-app.post('/api/fetch/cancel', (req, res) => {
+app.post('/api/fetch/cancel', requireAuth, requireFaculty, (req, res) => {
   if (batchProgress.is_running) {
     batchProgress.is_running = false;
     batchProgress.logs.push({
@@ -704,7 +795,7 @@ app.post('/api/fetch/cancel', (req, res) => {
 // ================= POTD & CURATED TRACKS ENDPOINTS =================
 
 // 14. POTD - Get Today's Challenge + Student Completion
-app.get('/api/potd', (req, res) => {
+app.get('/api/potd', requireAuth, (req, res) => {
   try {
     const potd = db.getTodayPOTD();
     const students = getAllEnrichedStudents();
@@ -745,7 +836,7 @@ app.get('/api/potd', (req, res) => {
 });
 
 // 15. POTD - Set / Override Problem of the Day
-app.post('/api/potd', (req, res) => {
+app.post('/api/potd', requireAuth, requireFaculty, (req, res) => {
   try {
     const { date, title, titleSlug, difficulty, topic, acceptanceRate, leetcodeUrl, hint } = req.body;
     if (!title || !titleSlug) {
@@ -772,7 +863,7 @@ app.post('/api/potd', (req, res) => {
 });
 
 // 16. Curated Tracks - Get All Tracks with Department Stats
-app.get('/api/tracks', (req, res) => {
+app.get('/api/tracks', requireAuth, (req, res) => {
   try {
     const tracks = db.getTracks();
     const students = getAllEnrichedStudents();
@@ -816,7 +907,7 @@ app.get('/api/tracks', (req, res) => {
 });
 
 // 17. Curated Tracks - Get Specific Track with Problem List & Per-Problem Solver Stats
-app.get('/api/tracks/:id', (req, res) => {
+app.get('/api/tracks/:id', requireAuth, (req, res) => {
   try {
     const track = db.getTrackById(req.params.id);
     if (!track) {
@@ -864,7 +955,7 @@ app.get('/api/tracks/:id', (req, res) => {
 // ================= SCHEDULER CONTROLS =================
 
 // 18. Scheduler - Get Status
-app.get('/api/scheduler/status', (req, res) => {
+app.get('/api/scheduler/status', requireAuth, requireFaculty, (req, res) => {
   const settings = db.getSettings();
   res.json({
     isEnabled: Boolean(settings.auto_sync_enabled),
@@ -876,7 +967,7 @@ app.get('/api/scheduler/status', (req, res) => {
 });
 
 // 19. Scheduler - Update Config
-app.post('/api/scheduler/config', (req, res) => {
+app.post('/api/scheduler/config', requireAuth, requireFaculty, (req, res) => {
   try {
     const { enabled, intervalHours } = req.body;
     const updated = db.updateSettings({
@@ -908,7 +999,7 @@ app.post('/api/scheduler/config', (req, res) => {
 });
 
 // 14. Leaderboard with configurable ranking
-app.get('/api/leaderboard', (req, res) => {
+app.get('/api/leaderboard', requireAuth, (req, res) => {
   try {
     let students = getAllEnrichedStudents();
     const { sort_by = 'engagement_score', section, year, batch } = req.query;
@@ -956,7 +1047,7 @@ app.get('/api/leaderboard', (req, res) => {
 });
 
 // 15. Sections & Batch Comparisons
-app.get('/api/sections', (req, res) => {
+app.get('/api/sections', requireAuth, requireFaculty, (req, res) => {
   try {
     const students = getAllEnrichedStudents();
     const settings = db.getSettings();
@@ -969,7 +1060,7 @@ app.get('/api/sections', (req, res) => {
 });
 
 // 16. Inactive Student Detection & Intervention Queue
-app.get('/api/intervention', (req, res) => {
+app.get('/api/intervention', requireAuth, requireFaculty, (req, res) => {
   try {
     const students = getAllEnrichedStudents();
     const settings = db.getSettings();
@@ -990,7 +1081,7 @@ app.get('/api/intervention', (req, res) => {
 });
 
 // 17. Reports - Excel 9-Sheet Export
-app.get('/api/reports/excel', (req, res) => {
+app.get('/api/reports/excel', requireAuth, requireFaculty, (req, res) => {
   try {
     const students = getAllEnrichedStudents();
     const allSnaps = db.getSnapshots();
@@ -1010,7 +1101,7 @@ app.get('/api/reports/excel', (req, res) => {
 });
 
 // 18. Reports - CSV Export
-app.get('/api/reports/csv', (req, res) => {
+app.get('/api/reports/csv', requireAuth, requireFaculty, (req, res) => {
   try {
     let students = getAllEnrichedStudents();
     const { section, year } = req.query;
@@ -1031,11 +1122,11 @@ app.get('/api/reports/csv', (req, res) => {
 });
 
 // 19. Settings - Get & Update
-app.get('/api/settings', (req, res) => {
+app.get('/api/settings', requireAuth, requireFaculty, (req, res) => {
   res.json(db.getSettings());
 });
 
-app.put('/api/settings', (req, res) => {
+app.put('/api/settings', requireAuth, requireFaculty, (req, res) => {
   try {
     const updated = db.updateSettings(req.body);
     db.addLog('INFO', 'Updated department tracker configuration & weight parameters.');
@@ -1046,7 +1137,7 @@ app.put('/api/settings', (req, res) => {
 });
 
 // 20. Reset to Demo Data
-app.post('/api/settings/reset-demo', (req, res) => {
+app.post('/api/settings/reset-demo', requireAuth, requireFaculty, (req, res) => {
   try {
     db.resetToDemo();
     db.addLog('INFO', 'Reset system database to default KGiSL CSBS student dataset.');
@@ -1057,7 +1148,7 @@ app.post('/api/settings/reset-demo', (req, res) => {
 });
 
 // 21. Clear Historical Snapshots
-app.post('/api/settings/clear-history', (req, res) => {
+app.post('/api/settings/clear-history', requireAuth, requireFaculty, (req, res) => {
   try {
     const { studentId } = req.body || {};
     db.deleteSnapshots(studentId);
